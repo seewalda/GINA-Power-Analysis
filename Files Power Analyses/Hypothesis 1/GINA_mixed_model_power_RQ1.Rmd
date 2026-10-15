@@ -1,0 +1,351 @@
+---
+title: "GINA Poweranalysis Research Question 1 (Mechanisms)"
+author: "Seewald"
+date: "14 10 2026"
+output: html_document
+---
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+### Delete Working Memory
+rm(list = ls())
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+# ============================================================================
+# Load Packages
+# ============================================================================
+
+library(lme4)
+library(dplyr)
+library(tidyr)
+library(MASS)
+library(Matrix)
+library(ggplot2)
+```
+
+```{r, echo = TRUE}
+# ============================================================================
+# Data Simulation
+# ============================================================================
+
+simulate_longitudinal_data_realistic <- function(n_persons = 180,
+                                                 n_therapists = 20,
+                                                 sd_therapist = 3,
+                                                 mean_neg = 2,          # avg. negative events/week
+                                                 mean_pos = 3,          # avg. positive events/week
+                                                 sd_log_rate = 0.4,     # between-person variability
+                                                 beta_neg_within  =  0.5,
+                                                 beta_pos_within  = -0.3,
+                                                 beta_neg_between =  1.0,
+                                                 beta_pos_between = -0.5,
+                                                 seed = 123) {
+  set.seed(seed)
+
+  # Balanced groups
+  groups <- rep(1:3, length.out = n_persons)
+  groups <- sample(groups)
+
+  # Therapists nested in conditions (7 / 7 / 6), balanced caseloads
+  therapist_condition <- rep(1:3, length.out = n_therapists)
+  therapist_of_person <- integer(n_persons)
+  for (g in 1:3) {
+    idx     <- which(groups == g)
+    ids     <- which(therapist_condition == g)
+    ids_rep <- rep(ids, length.out = length(idx))
+    therapist_of_person[idx] <- ids_rep[sample.int(length(ids_rep))]
+  }
+
+  # Therapist random intercepts
+  therapist_intercepts <- rnorm(n_therapists, mean = 0, sd = sd_therapist)
+  
+  # Correlation matrix 
+  correlation_matrix <- matrix(c(
+    1.0, 0.5,-0.3,-0.3,-0.3,-0.3, 0.3,
+    0.5, 1.0,-0.3,-0.3,-0.3,-0.3, 0.3,
+   -0.3,-0.3, 1.0, 0.1, 0.1, 0.1,-0.3,
+   -0.3,-0.3, 0.1, 1.0, 0.1, 0.1,-0.3,
+   -0.3,-0.3, 0.1, 0.1, 1.0, 0.1,-0.3,
+   -0.3,-0.3, 0.1, 0.1, 0.1, 1.0,-0.3,
+    0.3, 0.3,-0.3,-0.3,-0.3,-0.3, 1.0
+  ), nrow = 7, byrow = TRUE)
+  
+  var_names <- c("CQ_D", "CEQ", "PTQ", "SEK27", "BEAQ", "IIPD", "SF12")
+  rownames(correlation_matrix) <- var_names
+  colnames(correlation_matrix) <- var_names
+  
+  eigenvals <- eigen(correlation_matrix)$values
+  if (any(eigenvals <= 0.001)) {
+    correlation_matrix <- Matrix::nearPD(correlation_matrix, corr = TRUE)$mat
+    correlation_matrix <- as.matrix(correlation_matrix)}
+  
+# Group effects based on Cohen’s d
+  # Assumptions:
+  # - SD of changes (pooled within-group) ≈ 10 points
+  # - 9 time points (0–8), average change over the entire period
+  # - d = 0.80 for Group 1 → Total change = 0.80 * 10 = 8 points over 8 time points
+  # - d = 0.50 for Groups 2 & 3 → Total change = 0.50 * 10 = 5 points over 8 time points
+  
+  # Slope = Total change / Number of time units
+  group_slope_effects <- c(
+    "1" = -8.0 / 8,   # d = 0.80: -1.00 points per timepoint
+    "2" = -5.0 / 8,   # d = 0.50: -0.625 points per timepoint
+    "3" = -5.0 / 8    # d = 0.50: -0.625 points per timepoint
+  )
+  
+  # Random effects
+  # SD for random intercept 
+  sd_intercept <- 10.0
+  # SD for random slope
+  sd_slope <- 0.25
+  # corrrelation between intercept and slope
+  cor_int_slope <- -0.2
+  # covariance matrix
+  cov_int_slope <- cor_int_slope * sd_intercept * sd_slope
+  random_effects_vcov <- matrix(c(
+    sd_intercept^2, cov_int_slope,
+    cov_int_slope, sd_slope^2), nrow = 2)
+  
+  # Residual variance
+  residual_sd <- 5.0
+  
+  # Baseline values
+  baseline_corr_data <- MASS::mvrnorm(
+    n = n_persons, 
+    mu = rep(0, length(var_names)), 
+    Sigma = correlation_matrix)
+  
+  # Random effects for every single person
+  random_effects <- MASS::mvrnorm(
+    n = n_persons,
+    mu = c(0, 0),
+    Sigma = random_effects_vcov)
+   
+  # Person-specific weekly event rates
+  neg_rate <- exp(log(mean_neg) + rnorm(n_persons, 0, sd_log_rate))
+  pos_rate <- exp(log(mean_pos) + rnorm(n_persons, 0, sd_log_rate))
+  
+  timepoints <- c("After_PECAN", "T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8")
+  dataset <- data.frame()
+  
+  for (person_id in 1:n_persons) {
+    person_row <- data.frame(Person_ID = person_id)
+    person_row$group <- groups[person_id]
+    person_group <- as.character(groups[person_id])
+    
+    # Baseline PTQ (0-60 scale)
+    baseline_z <- baseline_corr_data[person_id, "PTQ"]
+    baseline_ptq <- 30 + 10 * baseline_z  # Mean ~30, SD ~10
+    
+    # Person-specific random effects
+    person_intercept <- random_effects[person_id, 1]
+    person_slope <- random_effects[person_id, 2]
+        # Therapist
+    person_row$therapist_ID <- therapist_of_person[person_id]
+    therapist_intercept <- therapist_intercepts[therapist_of_person[person_id]]
+    
+    # Group-specific Slope effects
+    group_slope <- group_slope_effects[[person_group]]
+    
+    # PTQ values over time
+    for (i in seq_along(timepoints)) {
+      timepoint <- timepoints[i]
+      time_value <- i - 1  # 0 to 8
+      
+      # Analysis
+      # Weekly event counts
+      neg_events <- rpois(1, neg_rate[person_id])
+      pos_events <- rpois(1, pos_rate[person_id])
+
+      expected_value <- baseline_ptq + person_intercept + therapist_intercept +
+                       (group_slope + person_slope) * time_value +
+                       beta_neg_within  * (neg_events - neg_rate[person_id]) +
+                       beta_pos_within  * (pos_events - pos_rate[person_id]) +
+                       beta_neg_between * (neg_rate[person_id] - mean_neg) +
+                       beta_pos_between * (pos_rate[person_id] - mean_pos)
+      
+      # Residual error 
+      residual_error <- rnorm(1, mean = 0, sd = residual_sd)
+      final_value <- expected_value + residual_error
+      
+      # Define scale (0-60)
+      final_value <- round(pmax(0, pmin(60, final_value)))
+      
+      person_row[[paste0("PTQ_", timepoint)]] <- final_value
+      person_row[[paste0("NEG_", timepoint)]] <- neg_events
+      person_row[[paste0("POS_", timepoint)]] <- pos_events
+    }
+
+    dataset <- rbind(dataset, person_row)}
+  
+  return(dataset)}
+
+
+# ============================================================================
+# Preprare data and fit model
+# ============================================================================
+
+prepare_long_format <- function(dataset) {
+  timepoints <- c("After_PECAN", "T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8")
+
+  long_data <- dataset %>%
+    tidyr::pivot_longer(
+      cols = dplyr::matches("^(PTQ|NEG|POS)_"),
+      names_to = c(".value", "timepoint"),
+      names_pattern = "^(PTQ|NEG|POS)_(.*)$") %>%
+    dplyr::rename(PTQ_value = PTQ,
+                  negative_events = NEG,
+                  positive_events = POS) %>%
+    dplyr::mutate(
+      timepoint_numeric = match(timepoint, timepoints) - 1,
+      group = factor(group),
+      therapist_ID = factor(therapist_ID)) %>%
+    # Person-mean centering (within-person part)
+    dplyr::group_by(Person_ID) %>%
+    dplyr::mutate(
+      neg_pm = mean(negative_events, na.rm = TRUE),
+      pos_pm = mean(positive_events, na.rm = TRUE),
+      neg_cw = negative_events - neg_pm,
+      pos_cw = positive_events - pos_pm) %>%
+    dplyr::ungroup() %>%
+    # Grand-mean centered person means (between-person part)
+    dplyr::mutate(
+      neg_pm_c = neg_pm - mean(neg_pm),
+      pos_pm_c = pos_pm - mean(pos_pm))
+
+  # Treatment coding: interaction terms are pairwise comparisons against
+  # group 1 (group2 = group 2 vs. 1, group3 = group 3 vs. 1).
+  # NOTE: with contr.sum(3) the terms are deviations from the grand mean
+  # instead, which are NOT the contrasts the hypothesis refers to.
+  contrasts(long_data$group) <- contr.treatment(3)
+
+  return(long_data)}
+
+fit_lmer_model <- function(long_data) {
+  tryCatch({
+    model <- lme4::lmer(
+                  PTQ_value ~ group * timepoint_numeric +
+        neg_cw + pos_cw + neg_pm_c + pos_pm_c +
+        (1 + timepoint_numeric | Person_ID) + (1 | therapist_ID),
+      data = long_data,
+      control = lme4::lmerControl(optimizer = "bobyqa", 
+                                    optCtrl = list(maxfun = 2e5)))
+    return(model)
+  }, error = function(e) {
+    return(NULL)})}
+
+empty_result <- function() {
+  data.frame(
+    term = c("group2:timepoint_numeric", "group3:timepoint_numeric"),
+    estimate = NA, se = NA, t_value = NA, p_value = NA,
+    significant = NA, singular = NA)}
+
+extract_interaction_effects <- function(model) {
+  if (is.null(model)) return(empty_result())
+
+  coef_summary <- summary(model)$coefficients
+  interaction_rows <- grep("group.*:timepoint_numeric", rownames(coef_summary))
+
+  if (length(interaction_rows) == 0) return(empty_result())
+  
+  interaction_coefs <- coef_summary[interaction_rows, , drop = FALSE]
+  p_values <- 2 * (1 - pnorm(abs(interaction_coefs[, "t value"])))
+  
+  results <- data.frame(
+    term = rownames(interaction_coefs),
+    estimate = interaction_coefs[, "Estimate"],
+    se = interaction_coefs[, "Std. Error"],
+    t_value = interaction_coefs[, "t value"],
+    p_value = p_values,
+    significant = p_values < 0.05,
+    singular = lme4::isSingular(model))
+
+  rownames(results) <- NULL
+  return(results)}
+
+
+# ============================================================================
+# Power Analysis
+# ============================================================================
+
+run_power_analysis <- function(sample_sizes = c(80, 120, 160, 200),
+                               n_simulations = 100,
+                               n_therapists = 20,
+                               sd_therapist = 3) {
+  power_results <- list()
+  
+  for (n in sample_sizes) {
+    cat("Running power analysis for n =", n, "\n")
+    sample_results <- list()
+    
+    for (sim in 1:n_simulations) {
+      if (sim %% 20 == 0) cat("  Simulation", sim, "/", n_simulations, "\n")
+      
+            sim_data <- simulate_longitudinal_data_realistic(
+        n_persons = n, n_therapists = n_therapists,
+        sd_therapist = sd_therapist, seed = 1000 * n + sim)
+      long_data <- prepare_long_format(sim_data)
+      model <- fit_lmer_model(long_data)
+      interaction_results <- extract_interaction_effects(model)
+      interaction_results$repetition <- sim
+      interaction_results$sample_size <- n
+      
+      sample_results[[sim]] <- interaction_results}
+    
+    if (length(sample_results) > 0) {
+      power_results[[as.character(n)]] <- do.call(rbind, sample_results)}}
+  
+  final_results <- do.call(rbind, power_results)
+  rownames(final_results) <- NULL
+  return(final_results)}
+
+calculate_power <- function(power_results) {
+  power_summary <- power_results %>%
+    dplyr::group_by(sample_size, term) %>%
+    dplyr::summarise(
+      power = mean(significant, na.rm = TRUE),
+      mean_estimate = mean(estimate, na.rm = TRUE),
+      mean_se = mean(se, na.rm = TRUE),
+      convergence_rate = sum(!is.na(p_value)) / dplyr::n(),
+      singular_rate = mean(singular, na.rm = TRUE),
+      .groups = "drop"
+    )
+  return(power_summary)}
+```
+
+```{r, results = 'hide', message = FALSE, warning = FALSE}
+# ============================================================================
+# Calculate Power
+# ============================================================================
+
+results_file <- "power_results_RQ1.rds"
+
+if (file.exists(results_file)) {
+  results <- readRDS(results_file)
+  cat("Load existing results:", results_file, "\n")
+} else {
+  results <- run_power_analysis(
+    sample_sizes = seq(160, 340, by = 10),
+    n_simulations = 1000)
+  saveRDS(results, results_file)}
+
+power_summary <- calculate_power(results)
+```
+
+```{r}
+# ============================================================================
+# Show Results
+# ============================================================================
+
+print(power_summary, n = Inf, width = Inf)
+
+ggplot(power_summary, aes(x = sample_size, y = power, color = term)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0.80, linetype = "dashed", color = "red") +
+  labs(title = "Power-Curve for Research Question 1",
+       x = "Sample Size (n)",
+       y = "Power (1 - β)",
+       color = "Interaction") +
+  theme_minimal() +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.1))
+```

@@ -1,0 +1,282 @@
+---
+title: "GINA Poweranalysis Research Question 2 (Matching Hypothesis)"
+author: "Seewald"
+date: "14 10 2026"
+output: html_document
+---
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+### Delete Working Memory
+rm(list = ls())
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+# ============================================================================
+# Load Packages
+# ============================================================================
+
+library(lme4)
+library(dplyr)
+library(tidyr)
+library(MASS)
+library(Matrix)
+library(ggplot2)
+```
+
+```{r, echo = TRUE}
+# ============================================================================
+# Data Simulation
+# ============================================================================
+# Model under investigation:
+#   SF12 ~ time * PECAN_match + time * Judgment_match + time * group +
+#          (time | Person_ID) + (1 | dyad_ID)
+#
+# Outcome: SF-12 Mental Component Score (norm based: M = 50, SD = 10),
+# higher values = better mental health.
+#
+# Design: patients are randomized 1:1:1 to one of three group therapies.
+# Independently of that, a PECAN recommendation and a clinical judgment are
+# recorded BEFORE randomization and remain blinded. Matching is therefore
+# random: P(PECAN_match = 1) = P(Judgment_match = 1) = 1/3.
+# The two recommendations are drawn independently, so their agreement is at
+# chance level (1/3); this keeps the two matching variables uncorrelated.
+#
+# PECAN recommendations are NOT uniformly distributed across the three
+# therapies (p_pecan_rec). This is why the allocated therapy enters the model
+# as an interaction with time: without it, differences between the therapies
+# would leak into the PECAN_match effect.
+#
+# Effect size calibration (verified by simulation, N = 3000, 40 seeds):
+#   delta_match = 0.372 points per week  ->  2.98 points over 8 weeks
+#   SD of change = 8.83  ->  Cohen's d = 0.33 (matched vs. mismatched)
+# NOTE: d = 0.32 refers to the MATCHED vs. MISMATCHED contrast. The advantage
+# of a PECAN-based selection rule over randomization is 2/3 of this
+# difference, because randomization already delivers the recommended therapy
+# to 1/3 of patients by chance (reported as policy_effect below).
+
+simulate_matching_data <- function(n_persons      = 240,
+                                   group_size     = 8,    # patients per therapy group
+                                   p_pecan_rec    = c(0.40, 0.35, 0.25),
+                                   group_slopes   = c(0.625, 0.625, 0.625),
+                                   sd_dyad        = 2,    # SD between therapist dyads
+                                   sd_intercept   = 8,    # SD between patients
+                                   sd_slope       = 0.30, # SD of individual slopes
+                                   residual_sd    = 6,
+                                   cor_int_slope  = -0.2,
+                                   delta_match    = 0.372,# PECAN match effect (d = 0.32)
+                                   delta_judgment = 0,    # clinical judgment: no effect
+                                   dropout_rate   = 0,    # add dropout after simulation
+                                   seed = 123) {
+  set.seed(seed)
+
+  # --- Therapist dyads: each dyad leads exactly one group of one condition ---
+  n_dyads   <- max(3, ceiling(n_persons / group_size))
+  dyad_cond <- rep(1:3, length.out = n_dyads)
+  dyad_int  <- rnorm(n_dyads, mean = 0, sd = sd_dyad)
+
+  # --- Randomization to one of the three therapies, then to a running group ---
+  allocated <- sample(rep(1:3, length.out = n_persons))
+  dyad_of_person <- integer(n_persons)
+  for (g in 1:3) {
+    idx <- which(allocated == g)
+    ids <- which(dyad_cond == g)
+    dyad_of_person[idx] <- rep(ids, length.out = length(idx))}
+
+  # --- Recommendations (recorded before randomization, blinded) ---
+  pecan_rec      <- sample(1:3, n_persons, replace = TRUE, prob = p_pecan_rec)
+  judgment_rec   <- sample(1:3, n_persons, replace = TRUE)
+  pecan_match    <- as.integer(allocated == pecan_rec)
+  judgment_match <- as.integer(allocated == judgment_rec)
+
+  # --- Random effects ---
+  cov_int_slope <- cor_int_slope * sd_intercept * sd_slope
+  random_effects <- MASS::mvrnorm(
+    n = n_persons, mu = c(0, 0),
+    Sigma = matrix(c(sd_intercept^2, cov_int_slope,
+                     cov_int_slope,  sd_slope^2), nrow = 2))
+
+  # --- Long format: 9 measurement points (before session 1 + after each) ---
+  dataset <- expand.grid(time = 0:8, Person_ID = 1:n_persons)
+  p <- dataset$Person_ID
+
+  dataset$group          <- factor(allocated[p])
+  dataset$dyad_ID        <- factor(dyad_of_person[p])
+  dataset$PECAN_match    <- pecan_match[p]
+  dataset$Judgment_match <- judgment_match[p]
+
+  dataset$SF12 <- 50 +
+    random_effects[p, 1] + dyad_int[dyad_of_person[p]] +
+    (group_slopes[allocated[p]] + random_effects[p, 2] +
+       delta_match    * pecan_match[p] +
+       delta_judgment * judgment_match[p]) * dataset$time +
+    rnorm(nrow(dataset), mean = 0, sd = residual_sd)
+
+  # --- Monotone dropout: no further measurements after the last session ---
+  if (dropout_rate > 0) {
+    drops <- which(runif(n_persons) < dropout_rate)
+    last  <- sample(1:7, length(drops), replace = TRUE)
+    keep  <- rep(TRUE, nrow(dataset))
+    for (i in seq_along(drops)) keep[p == drops[i] & dataset$time > last[i]] <- FALSE
+    dataset <- dataset[keep, ]}
+
+  return(dataset)}
+
+
+# ============================================================================
+# Prepare data and fit model
+# ============================================================================
+
+prepare_long_format <- function(dataset) {
+  # Treatment coding of the allocated therapy (group 1 = reference)
+  contrasts(dataset$group) <- contr.treatment(3)
+  return(dataset)}
+
+fit_lmer_model <- function(long_data) {
+  tryCatch({
+    model <- lme4::lmer(
+      SF12 ~ time * PECAN_match + time * Judgment_match + time * group +
+        (1 + time | Person_ID) + (1 | dyad_ID),
+      data = long_data,
+      control = lme4::lmerControl(optimizer = "bobyqa",
+                                    optCtrl = list(maxfun = 2e5)))
+    return(model)
+  }, error = function(e) {
+    return(NULL)})}
+
+empty_result <- function() {
+  data.frame(
+    term = c("PECAN_match:time", "Judgment_match:time", "PECAN vs. judgment"),
+    estimate = NA, se = NA, t_value = NA, p_value = NA,
+    significant = NA, singular = NA, policy_effect = NA)}
+
+# Returns the two matching effects and, as an additional exploratory quantity,
+# their difference. Entering both predictors does NOT by itself test whether
+# PECAN outperforms clinical judgment; that requires the contrast
+# b(PECAN) - b(judgment), computed here from the covariance matrix of the
+# fixed effects.
+extract_matching_effects <- function(model) {
+  if (is.null(model)) return(empty_result())
+
+  coef_summary <- summary(model)$coefficients
+  V  <- as.matrix(vcov(model))
+  np <- grep("^(time:PECAN_match|PECAN_match:time)$",
+             rownames(coef_summary), value = TRUE)
+  nj <- grep("^(time:Judgment_match|Judgment_match:time)$",
+             rownames(coef_summary), value = TRUE)
+  if (length(np) == 0 || length(nj) == 0) return(empty_result())
+
+  b_pecan    <- coef_summary[np, "Estimate"]
+  b_judgment <- coef_summary[nj, "Estimate"]
+  estimates  <- c(b_pecan, b_judgment, b_pecan - b_judgment)
+  ses <- c(coef_summary[np, "Std. Error"],
+           coef_summary[nj, "Std. Error"],
+           sqrt(V[np, np] + V[nj, nj] - 2 * V[np, nj]))
+  t_values <- estimates / ses
+  p_values <- 2 * (1 - pnorm(abs(t_values)))
+
+  results <- data.frame(
+    term = c("PECAN_match:time", "Judgment_match:time", "PECAN vs. judgment"),
+    estimate = estimates,
+    se = ses,
+    t_value = t_values,
+    p_value = p_values,
+    significant = p_values < 0.05,
+    singular = lme4::isSingular(model),
+    # Advantage of a PECAN-based selection rule over randomization:
+    # 2/3 of the matched-mismatched difference (see note above).
+    policy_effect = c((2/3) * b_pecan, (2/3) * b_judgment, NA))
+
+  rownames(results) <- NULL
+  return(results)}
+
+
+# ============================================================================
+# Power Analysis
+# ============================================================================
+
+run_power_analysis <- function(sample_sizes = c(120, 180, 240, 300),
+                               n_simulations = 100,
+                               group_size = 8,
+                               delta_match = 0.372,
+                               delta_judgment = 0,
+                               p_pecan_rec = c(0.40, 0.35, 0.25),
+                               group_slopes = c(0.625, 0.625, 0.625)) {
+  power_results <- list()
+
+  for (n in sample_sizes) {
+    cat("Running power analysis for n =", n, "\n")
+    sample_results <- list()
+
+    for (sim in 1:n_simulations) {
+      if (sim %% 20 == 0) cat("  Simulation", sim, "/", n_simulations, "\n")
+
+      sim_data <- simulate_matching_data(
+        n_persons = n, group_size = group_size,
+        p_pecan_rec = p_pecan_rec, group_slopes = group_slopes,
+        delta_match = delta_match, delta_judgment = delta_judgment,
+        seed = 1000 * n + sim)
+      long_data <- prepare_long_format(sim_data)
+      model <- fit_lmer_model(long_data)
+      matching_results <- extract_matching_effects(model)
+      matching_results$repetition <- sim
+      matching_results$sample_size <- n
+
+      sample_results[[sim]] <- matching_results}
+
+    if (length(sample_results) > 0) {
+      power_results[[as.character(n)]] <- do.call(rbind, sample_results)}}
+
+  final_results <- do.call(rbind, power_results)
+  rownames(final_results) <- NULL
+  return(final_results)}
+
+calculate_power <- function(power_results) {
+  power_summary <- power_results %>%
+    dplyr::group_by(sample_size, term) %>%
+    dplyr::summarise(
+      power = mean(significant, na.rm = TRUE),
+      mean_estimate = mean(estimate, na.rm = TRUE),
+      mean_se = mean(se, na.rm = TRUE),
+      convergence_rate = sum(!is.na(p_value)) / dplyr::n(),
+      singular_rate = mean(singular, na.rm = TRUE),
+      .groups = "drop")
+  return(power_summary)}
+```
+
+```{r, results = 'hide', message = FALSE, warning = FALSE}
+# ============================================================================
+# Calculate Power
+# ============================================================================
+
+results_file <- "power_results_RQ2.rds"
+
+if (file.exists(results_file)) {
+  results <- readRDS(results_file)
+  cat("Load existing results:", results_file, "\n")
+} else {
+  results <- run_power_analysis(
+    sample_sizes = seq(160, 340, by = 10),
+    n_simulations = 1000)
+  saveRDS(results, results_file)}
+
+power_summary <- calculate_power(results)
+```
+
+```{r}
+# ============================================================================
+# Show Results
+# ============================================================================
+
+print(power_summary, n = Inf, width = Inf)
+
+ggplot(power_summary, aes(x = sample_size, y = power, color = term)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0.80, linetype = "dashed", color = "red") +
+  labs(title = "Power-Curve for Research Question 2",
+       x = "Sample Size (n)",
+       y = "Power (1 - β)",
+       color = "Effect") +
+  theme_minimal() +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.1))
+```
